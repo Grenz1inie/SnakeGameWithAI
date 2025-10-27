@@ -22,9 +22,14 @@ namespace SnakeGame
         static async Task Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
-            var mode = ShowStartMenu();
-            var game = new Game(mode);
-            await game.Start();
+            // Loop so after a game ends we return to the main menu
+            while (true)
+            {
+                var mode = ShowStartMenu();
+                var game = new Game(mode);
+                await game.Start();
+                // after Start returns, loop back to show menu again
+            }
         }
 
         private static GameMode ShowStartMenu()
@@ -32,9 +37,14 @@ namespace SnakeGame
             Console.CursorVisible = true;
             Console.Clear();
             Console.WriteLine("===== 贪吃蛇游戏 =====");
-            Console.WriteLine("说明：方向键操作，Esc 退出。");
+            Console.WriteLine("说明：下面列出本游戏支持的按键操作：");
             Console.WriteLine();
-            Console.WriteLine("1. 本地关卡 (随机生成食物)");
+            Console.WriteLine("  - 方向键 (↑ ↓ ← →)：游戏中控制蛇移动");
+            Console.WriteLine("  - Esc：在任意时刻退出游戏");
+            Console.WriteLine("  - Space：暂停游戏");
+            Console.WriteLine();
+            Console.WriteLine();
+            Console.WriteLine("1. 训练 (随机生成食物且没有障碍)");
             Console.WriteLine("2. AI生成关卡 (AI决定食物位置)");
             Console.WriteLine();
             Console.Write("请选择模式 (1/2): ");
@@ -70,6 +80,10 @@ namespace SnakeGame
         private int survivalTime;
         private int maxSnakeLength;
         private DateTime startTime;
+    // pause handling
+    private bool paused = false;
+    private DateTime? pauseStart = null;
+    private TimeSpan pausedTotal = TimeSpan.Zero;
         private string collisionReason = "";
 
         // persistent AI message (won't be lost by Console.Clear as we reprint it)
@@ -126,7 +140,11 @@ namespace SnakeGame
                     PrintPersistentAiLine(); // ensure persistent AI message reprinted each frame
                 }
 
-                snake.Move();
+                // Only move when not paused
+                if (!paused)
+                {
+                    snake.Move();
+                }
 
                 if (snake.Head.X == food.X && snake.Head.Y == food.Y)
                 {
@@ -158,7 +176,9 @@ namespace SnakeGame
                     break;
                 }
 
-                survivalTime = (int)(DateTime.Now - startTime).TotalSeconds;
+                // survivalTime should exclude paused duration
+                var effectiveElapsed = DateTime.Now - startTime - pausedTotal;
+                survivalTime = (int)effectiveElapsed.TotalSeconds;
 
                 Thread.Sleep(120);
             }
@@ -192,7 +212,8 @@ namespace SnakeGame
             }
 
             Console.ReadKey(true);
-            Environment.Exit(0);
+            // Return to caller (Main) so the main menu is shown again.
+            return;
         }
 
         private void SafeSetCursor(int x, int y)
@@ -227,6 +248,14 @@ namespace SnakeGame
             Console.Write(new string(' ', width));
             SafeSetCursor(0, aiPersistentLine);
             string show = lastAiMessage ?? "";
+            if (paused)
+            {
+                // show paused indicator after AI message if space permits
+                if (show.Length + 12 < width)
+                    show = show + "    [已暂停 - 按 空格 继续]";
+                else
+                    show = "[已暂停 - 按 空格 继续]";
+            }
             if (show.Length > width - 4) show = show.Substring(0, width - 7) + "...";
             Console.Write("AI: " + show);
         }
@@ -264,6 +293,30 @@ namespace SnakeGame
                     var k = Console.ReadKey(true);
                     switch (k.Key)
                     {
+                        case ConsoleKey.Spacebar:
+                            // toggle pause
+                            lock (_consoleLock)
+                            {
+                                paused = !paused;
+                                if (paused)
+                                {
+                                    pauseStart = DateTime.Now;
+                                }
+                                else
+                                {
+                                    if (pauseStart.HasValue)
+                                    {
+                                        pausedTotal += (DateTime.Now - pauseStart.Value);
+                                        pauseStart = null;
+                                    }
+                                }
+                                // force redraw to show paused state immediately
+                                Console.Clear();
+                                DrawBoundary();
+                                DisplayGame();
+                                PrintPersistentAiLine();
+                            }
+                            break;
                         case ConsoleKey.UpArrow:
                             if (snake.CurrentDirection != Direction.Down) snake.CurrentDirection = Direction.Up;
                             break;
