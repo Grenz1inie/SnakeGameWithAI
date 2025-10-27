@@ -23,10 +23,11 @@ namespace SnakeGame
         {
             Console.OutputEncoding = Encoding.UTF8;
             // Loop so after a game ends we return to the main menu
+            var aiService = new AIService();
             while (true)
             {
                 var mode = ShowStartMenu();
-                var game = new Game(mode);
+                var game = new Game(mode, aiService);
                 await game.Start();
                 // after Start returns, loop back to show menu again
             }
@@ -52,6 +53,8 @@ namespace SnakeGame
             while (true)
             {
                 var key = Console.ReadKey(true);
+                // 在主菜单中按 Esc 退出程序
+                if (key.Key == ConsoleKey.Escape) Environment.Exit(0);
                 if (key.KeyChar == '1') return GameMode.Local;
                 if (key.KeyChar == '2') return GameMode.AI;
             }
@@ -59,6 +62,172 @@ namespace SnakeGame
     }
 
     public enum GameMode { Local, AI }
+
+    // Holds the mutable game state
+    public class GameState
+    {
+        public int Score { get; set; }
+        public int SurvivalTime { get; set; }
+        public int MaxSnakeLength { get; set; }
+        public DateTime StartTime { get; set; }
+        public bool Paused { get; private set; } = false;
+        public DateTime? PauseStart { get; private set; } = null;
+        public TimeSpan PausedTotal { get; private set; } = TimeSpan.Zero;
+        public string CollisionReason { get; set; } = "";
+        public string LastAiMessage { get; set; } = "";
+
+        public void TogglePause()
+        {
+            Paused = !Paused;
+            if (Paused)
+            {
+                PauseStart = DateTime.Now;
+            }
+            else
+            {
+                if (PauseStart.HasValue)
+                {
+                    PausedTotal += (DateTime.Now - PauseStart.Value);
+                    PauseStart = null;
+                }
+            }
+        }
+
+        public int ComputeSurvivalSeconds()
+        {
+            var effectiveElapsed = DateTime.Now - StartTime - PausedTotal;
+            return (int)effectiveElapsed.TotalSeconds;
+        }
+    }
+
+    // Responsible for all console rendering
+    public class ConsoleRenderer
+    {
+        private void SafeSetCursor(int x, int y)
+        {
+            int maxX = Math.Max(0, Console.BufferWidth - 1);
+            int maxY = Math.Max(0, Console.BufferHeight - 1);
+            int cx = Math.Clamp(x, 0, maxX);
+            int cy = Math.Clamp(y, 0, maxY);
+            Console.SetCursorPosition(cx, cy);
+        }
+
+        public void DrawBoundary(int displayWidth, int displayHeight)
+        {
+            int w = displayWidth;
+            int h = displayHeight;
+            for (int x = 0; x <= w; x++)
+            {
+                SafeSetCursor(x, 0); Console.Write("#");
+                SafeSetCursor(x, h); Console.Write("#");
+            }
+            for (int y = 1; y < h; y++)
+            {
+                SafeSetCursor(0, y); Console.Write("#");
+                SafeSetCursor(w, y); Console.Write("#");
+            }
+        }
+
+        public void DisplayGame(List<Position> body, Position food, int displayWidth, int displayHeight, int infoLine, int score, int survivalTime, int maxSnakeLength)
+        {
+            foreach (var p in body)
+            {
+                if (p.X > 0 && p.X < displayWidth && p.Y > 0 && p.Y < displayHeight)
+                {
+                    SafeSetCursor(p.X, p.Y);
+                    Console.Write("■");
+                }
+            }
+
+            if (food.X > 0 && food.X < displayWidth && food.Y > 0 && food.Y < displayHeight)
+            {
+                SafeSetCursor(food.X, food.Y);
+                Console.Write("●");
+            }
+
+            SafeSetCursor(0, infoLine);
+            int width = Math.Max(0, Console.WindowWidth - 1);
+            Console.Write(new string(' ', width));
+            SafeSetCursor(0, infoLine);
+            Console.Write($"Score: {score}   Time: {survivalTime}s   MaxLen: {maxSnakeLength}");
+        }
+
+        public void PrintPersistentAiLine(string lastAiMessage, int aiPersistentLine, bool paused)
+        {
+            SafeSetCursor(0, aiPersistentLine);
+            int width = Math.Max(0, Console.WindowWidth - 1);
+            Console.Write(new string(' ', width));
+            SafeSetCursor(0, aiPersistentLine);
+            string show = lastAiMessage ?? "";
+            if (paused)
+            {
+                if (show.Length + 12 < width)
+                    show = show + "    [已暂停 - 按 空格 继续]";
+                else
+                    show = "[已暂停 - 按 空格 继续]";
+            }
+            if (show.Length > width - 4) show = show.Substring(0, width - 7) + "...";
+            Console.Write("AI: " + show);
+        }
+
+        public void RenderFrame(List<Position> body, Position food, int displayWidth, int displayHeight, int infoLine, int aiPersistentLine, string lastAiMessage, int score, int survivalTime, int maxSnakeLength, bool paused)
+        {
+            Console.Clear();
+            DrawBoundary(displayWidth, displayHeight);
+            DisplayGame(body, food, displayWidth, displayHeight, infoLine, score, survivalTime, maxSnakeLength);
+            PrintPersistentAiLine(lastAiMessage, aiPersistentLine, paused);
+        }
+    }
+
+    // Handles keyboard input and raises events
+    public class InputHandler
+    {
+    public event Action<Direction>? DirectionChanged;
+    public event Action? PauseToggled;
+    public event Action? ExitRequested;
+
+        private bool _running = true;
+
+        public void Start()
+        {
+            Task.Run(() => RunLoop());
+        }
+
+        private void RunLoop()
+        {
+            while (_running)
+            {
+                if (Console.KeyAvailable)
+                {
+                    var k = Console.ReadKey(true);
+                    switch (k.Key)
+                    {
+                        case ConsoleKey.Spacebar:
+                            PauseToggled?.Invoke();
+                            break;
+                        case ConsoleKey.UpArrow:
+                            DirectionChanged?.Invoke(Direction.Up);
+                            break;
+                        case ConsoleKey.DownArrow:
+                            DirectionChanged?.Invoke(Direction.Down);
+                            break;
+                        case ConsoleKey.LeftArrow:
+                            DirectionChanged?.Invoke(Direction.Left);
+                            break;
+                        case ConsoleKey.RightArrow:
+                            DirectionChanged?.Invoke(Direction.Right);
+                            break;
+                        case ConsoleKey.Escape:
+                            ExitRequested?.Invoke();
+                            break;
+                    }
+                }
+                Thread.Sleep(8);
+            }
+        }
+
+        public void Stop() => _running = false;
+    }
 
     public class Game
     {
@@ -76,23 +245,21 @@ namespace SnakeGame
         private readonly AIService aiService;
         private readonly GameMode gameMode;
 
-        private int score;
-        private int survivalTime;
-        private int maxSnakeLength;
-        private DateTime startTime;
-    // pause handling
-    private bool paused = false;
-    private DateTime? pauseStart = null;
-    private TimeSpan pausedTotal = TimeSpan.Zero;
-        private string collisionReason = "";
+        // composed helpers
+        private readonly GameState state;
+        private readonly ConsoleRenderer renderer;
+        private readonly InputHandler inputHandler;
+        // when true, user requested to return to main menu
+        private volatile bool exitToMenuRequested = false;
 
-        // persistent AI message (won't be lost by Console.Clear as we reprint it)
-        private string lastAiMessage = "";
-
-        public Game(GameMode mode)
+        public Game(GameMode mode, AIService aiService)
         {
             gameMode = mode;
-            aiService = new AIService();
+            this.aiService = aiService;
+
+            state = new GameState();
+            renderer = new ConsoleRenderer();
+            inputHandler = new InputHandler();
 
             int bufW = Math.Max(20, Console.BufferWidth);
             int bufH = Math.Max(25, Console.BufferHeight);
@@ -105,9 +272,47 @@ namespace SnakeGame
             summaryStartLine = displayHeight + 4;
 
             snake = new Snake(new Position(10, 10));
-            score = 0;
-            survivalTime = 0;
-            maxSnakeLength = 1;
+            state.Score = 0;
+            state.SurvivalTime = 0;
+            state.MaxSnakeLength = 1;
+
+            // hook input events
+            inputHandler.DirectionChanged += (dir) => {
+                lock (_consoleLock)
+                {
+                    switch (dir)
+                    {
+                        case Direction.Up:
+                            if (snake.CurrentDirection != Direction.Down) snake.CurrentDirection = Direction.Up;
+                            break;
+                        case Direction.Down:
+                            if (snake.CurrentDirection != Direction.Up) snake.CurrentDirection = Direction.Down;
+                            break;
+                        case Direction.Left:
+                            if (snake.CurrentDirection != Direction.Right) snake.CurrentDirection = Direction.Left;
+                            break;
+                        case Direction.Right:
+                            if (snake.CurrentDirection != Direction.Left) snake.CurrentDirection = Direction.Right;
+                            break;
+                    }
+                }
+            };
+            inputHandler.PauseToggled += () => {
+                lock (_consoleLock)
+                {
+                    state.TogglePause();
+                    // immediate redraw
+                    renderer.RenderFrame(snake.Body, food, displayWidth, displayHeight, infoLine, aiPersistentLine, state.LastAiMessage, state.Score, state.ComputeSurvivalSeconds(), state.MaxSnakeLength, state.Paused);
+                }
+            };
+            // 在游戏中按 Esc 应当回到主菜单，而不是退出整个进程
+            inputHandler.ExitRequested += () => {
+                lock (_consoleLock)
+                {
+                    exitToMenuRequested = true;
+                }
+            };
+            inputHandler.Start();
 
             GenerateFood().Wait();
         }
@@ -115,53 +320,62 @@ namespace SnakeGame
         public async Task Start()
         {
             Console.CursorVisible = false;
-            startTime = DateTime.Now;
+            state.StartTime = DateTime.Now;
 
             // 1) AI at game start — request a single short sentence (no explanation)
             try
             {
                 string startPrompt = $"游戏开始。模式={gameMode}。请只输出几句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
-                lastAiMessage = await aiService.GetInteractionOnceAsync(startPrompt);
+                state.LastAiMessage = await aiService.GetInteractionOnceAsync(startPrompt);
             }
             catch
             {
-                lastAiMessage = "[AI 暂不可用]";
+                state.LastAiMessage = "[AI 暂不可用]";
             }
 
-            var inputTask = Task.Run(() => ListenForInput());
+            // input handler already started in constructor
 
             while (true)
             {
-                // 每帧渲染抽取为独立方法，包含清屏/画边界/显示游戏/打印 AI 消息
-                RenderFrame();
+                // 每帧渲染：计算当前生存时间以供渲染
+                int currentSurvival = state.ComputeSurvivalSeconds();
+                renderer.RenderFrame(snake.Body, food, displayWidth, displayHeight, infoLine, aiPersistentLine, state.LastAiMessage, state.Score, currentSurvival, state.MaxSnakeLength, state.Paused);
+
+                if (exitToMenuRequested)
+                {
+                    // Stop input handler and return to menu without running game-over summary
+                    inputHandler.Stop();
+                    Console.CursorVisible = true;
+                    return;
+                }
 
                 // Only move when not paused
-                if (!paused)
+                if (!state.Paused)
                 {
                     snake.Move();
                 }
 
                 if (snake.Head.X == food.X && snake.Head.Y == food.Y)
                 {
-                    score++;
+                    state.Score++;
                     snake.Grow();
-                    maxSnakeLength = Math.Max(maxSnakeLength, snake.Body.Count);
+                    state.MaxSnakeLength = Math.Max(state.MaxSnakeLength, snake.Body.Count);
 
                     // 2) AI on eating food — request a single short sentence (no explanation)
                     try
                     {
-                        string state = $"玩家吃到食物。Score={score}, Time={(int)(DateTime.Now - startTime).TotalSeconds}s, Head=({snake.Head.X},{snake.Head.Y}). 请只输出几句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
-                        string aiReply = await aiService.GetInteractionOnEatAsync(state);
-                        lastAiMessage = aiReply;
+                        string prompt = $"玩家吃到食物。Score={state.Score}, Time={state.ComputeSurvivalSeconds()}s, Head=({snake.Head.X},{snake.Head.Y}). 请只输出几句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
+                        string aiReply = await aiService.GetInteractionOnEatAsync(prompt);
+                        state.LastAiMessage = aiReply;
                         lock (_consoleLock)
                         {
-                            PrintPersistentAiLine(); // immediately show it
+                            renderer.PrintPersistentAiLine(state.LastAiMessage, aiPersistentLine, state.Paused); // immediately show it
                         }
                     }
-                    catch
-                    {
-                        lastAiMessage = "[AI 互动失败]";
-                    }
+                        catch
+                        {
+                            state.LastAiMessage = "[AI 互动失败]";
+                        }
 
                     await GenerateFood();
                 }
@@ -171,15 +385,16 @@ namespace SnakeGame
                     break;
                 }
 
-                // survivalTime should exclude paused duration
-                var effectiveElapsed = DateTime.Now - startTime - pausedTotal;
-                survivalTime = (int)effectiveElapsed.TotalSeconds;
+                // update survival time into state
+                state.SurvivalTime = state.ComputeSurvivalSeconds();
 
                 Thread.Sleep(120);
             }
 
             // 3) AI at game over — detailed summary (can be multi-sentence)
-            string summaryPrompt = $"玩家本局得分 {score}，存活 {survivalTime} 秒，最大蛇身长度 {maxSnakeLength}，碰撞原因：{collisionReason}。请生成：1) 几句本局总结（简明具体），2) 一条长期训练建议。返回纯文本。";
+            // 停止输入监听线程（正常结束）
+            inputHandler.Stop();
+            string summaryPrompt = $"玩家本局得分 {state.Score}，存活 {state.SurvivalTime} 秒，最大蛇身长度 {state.MaxSnakeLength}，碰撞原因：{state.CollisionReason}。请生成：1) 几句本局总结（简明具体），2) 一条长期训练建议。返回纯文本。";
             string aiSummary;
             try
             {
@@ -193,12 +408,11 @@ namespace SnakeGame
             lock (_consoleLock)
             {
                 Console.Clear();
-                SafeSetCursor(0, 0);
                 Console.WriteLine("===== 游戏结束 =====");
-                Console.WriteLine($"最终得分: {score}");
-                Console.WriteLine($"存活时间: {survivalTime} 秒");
-                Console.WriteLine($"最大蛇身长度: {maxSnakeLength}");
-                Console.WriteLine($"碰撞原因: {collisionReason}");
+                Console.WriteLine($"最终得分: {state.Score}");
+                Console.WriteLine($"存活时间: {state.SurvivalTime} 秒");
+                Console.WriteLine($"最大蛇身长度: {state.MaxSnakeLength}");
+                Console.WriteLine($"碰撞原因: {state.CollisionReason}");
                 Console.WriteLine();
                 Console.WriteLine("----- AI 复盘建议 -----");
                 Console.WriteLine(aiSummary);
@@ -211,136 +425,7 @@ namespace SnakeGame
             return;
         }
 
-        private void SafeSetCursor(int x, int y)
-        {
-            int maxX = Math.Max(0, Console.BufferWidth - 1);
-            int maxY = Math.Max(0, Console.BufferHeight - 1);
-            int cx = Math.Clamp(x, 0, maxX);
-            int cy = Math.Clamp(y, 0, maxY);
-            Console.SetCursorPosition(cx, cy);
-        }
-
-        private void DrawBoundary()
-        {
-            int w = displayWidth;
-            int h = displayHeight;
-            for (int x = 0; x <= w; x++)
-            {
-                SafeSetCursor(x, 0); Console.Write("#");
-                SafeSetCursor(x, h); Console.Write("#");
-            }
-            for (int y = 1; y < h; y++)
-            {
-                SafeSetCursor(0, y); Console.Write("#");
-                SafeSetCursor(w, y); Console.Write("#");
-            }
-        }
-
-        private void PrintPersistentAiLine()
-        {
-            SafeSetCursor(0, aiPersistentLine);
-            int width = Math.Max(0, Console.WindowWidth - 1);
-            Console.Write(new string(' ', width));
-            SafeSetCursor(0, aiPersistentLine);
-            string show = lastAiMessage ?? "";
-            if (paused)
-            {
-                // show paused indicator after AI message if space permits
-                if (show.Length + 12 < width)
-                    show = show + "    [已暂停 - 按 空格 继续]";
-                else
-                    show = "[已暂停 - 按 空格 继续]";
-            }
-            if (show.Length > width - 4) show = show.Substring(0, width - 7) + "...";
-            Console.Write("AI: " + show);
-        }
-
-        // 每帧渲染：清屏、画边界、显示游戏与持久 AI 行
-        private void RenderFrame()
-        {
-            lock (_consoleLock)
-            {
-                Console.Clear();
-                DrawBoundary();
-                DisplayGame();
-                PrintPersistentAiLine();
-            }
-        }
-
-        private void DisplayGame()
-        {
-            foreach (var p in snake.Body)
-            {
-                if (IsInsideDisplayArea(p))
-                {
-                    SafeSetCursor(p.X, p.Y);
-                    Console.Write("■");
-                }
-            }
-
-            if (IsInsideDisplayArea(food))
-            {
-                SafeSetCursor(food.X, food.Y);
-                Console.Write("●");
-            }
-
-            SafeSetCursor(0, infoLine);
-            int width = Math.Max(0, Console.WindowWidth - 1);
-            Console.Write(new string(' ', width));
-            SafeSetCursor(0, infoLine);
-            Console.Write($"Score: {score}   Time: {survivalTime}s   MaxLen: {maxSnakeLength}");
-        }
-
-        private void ListenForInput()
-        {
-            while (true)
-            {
-                if (Console.KeyAvailable)
-                {
-                    var k = Console.ReadKey(true);
-                    switch (k.Key)
-                    {
-                        case ConsoleKey.Spacebar:
-                            // toggle pause
-                            lock (_consoleLock)
-                            {
-                                paused = !paused;
-                                if (paused)
-                                {
-                                    pauseStart = DateTime.Now;
-                                }
-                                else
-                                {
-                                    if (pauseStart.HasValue)
-                                    {
-                                        pausedTotal += (DateTime.Now - pauseStart.Value);
-                                        pauseStart = null;
-                                    }
-                                }
-                                // force redraw to show paused state immediately
-                                RenderFrame();
-                            }
-                            break;
-                        case ConsoleKey.UpArrow:
-                            if (snake.CurrentDirection != Direction.Down) snake.CurrentDirection = Direction.Up;
-                            break;
-                        case ConsoleKey.DownArrow:
-                            if (snake.CurrentDirection != Direction.Up) snake.CurrentDirection = Direction.Down;
-                            break;
-                        case ConsoleKey.LeftArrow:
-                            if (snake.CurrentDirection != Direction.Right) snake.CurrentDirection = Direction.Left;
-                            break;
-                        case ConsoleKey.RightArrow:
-                            if (snake.CurrentDirection != Direction.Left) snake.CurrentDirection = Direction.Right;
-                            break;
-                        case ConsoleKey.Escape:
-                            Environment.Exit(0);
-                            break;
-                    }
-                }
-                Thread.Sleep(8);
-            }
-        }
+        // input handled by InputHandler and rendering handled by ConsoleRenderer
 
         private async Task GenerateFood()
         {
@@ -415,12 +500,12 @@ namespace SnakeGame
         {
             if (snake.Head.X <= 0 || snake.Head.X >= displayWidth || snake.Head.Y <= 0 || snake.Head.Y >= displayHeight)
             {
-                collisionReason = "撞到边界";
+                state.CollisionReason = "撞到边界";
                 return true;
             }
             if (snake.Body.Skip(1).Any(p => p.X == snake.Head.X && p.Y == snake.Head.Y))
             {
-                collisionReason = "撞到自己";
+                state.CollisionReason = "撞到自己";
                 return true;
             }
             return false;
