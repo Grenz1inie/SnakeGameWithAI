@@ -132,13 +132,8 @@ namespace SnakeGame
 
             while (true)
             {
-                lock (_consoleLock)
-                {
-                    Console.Clear();
-                    DrawBoundary();
-                    DisplayGame();
-                    PrintPersistentAiLine(); // ensure persistent AI message reprinted each frame
-                }
+                // 每帧渲染抽取为独立方法，包含清屏/画边界/显示游戏/打印 AI 消息
+                RenderFrame();
 
                 // Only move when not paused
                 if (!paused)
@@ -260,6 +255,18 @@ namespace SnakeGame
             Console.Write("AI: " + show);
         }
 
+        // 每帧渲染：清屏、画边界、显示游戏与持久 AI 行
+        private void RenderFrame()
+        {
+            lock (_consoleLock)
+            {
+                Console.Clear();
+                DrawBoundary();
+                DisplayGame();
+                PrintPersistentAiLine();
+            }
+        }
+
         private void DisplayGame()
         {
             foreach (var p in snake.Body)
@@ -311,10 +318,7 @@ namespace SnakeGame
                                     }
                                 }
                                 // force redraw to show paused state immediately
-                                Console.Clear();
-                                DrawBoundary();
-                                DisplayGame();
-                                PrintPersistentAiLine();
+                                RenderFrame();
                             }
                             break;
                         case ConsoleKey.UpArrow:
@@ -490,15 +494,10 @@ namespace SnakeGame
         public async Task<string> GetInteractionOnceAsync(string stateSummary)
         {
             // 系统提示加强：要求多样性、避免重复、限制长度并提供风格选项
-            var body = new
-            {
-                model = model,
-                messages = new object[]
-                {
-                    new { role = "system", content = "你是友好的游戏助手。每次回复要保持表达多样性，避免重复之前在同一局或同一会话中使用过的整句或固定短语。可在风格上随机选择：幽默、直率、温和或简洁，但每次仅输出几句中文（不超过30字），内容须是具体的鼓励或可执行的小建议。不要解释、不要额外文本、不要引号。" },
-                    new { role = "user", content = stateSummary + " 请只输出几句中文鼓励或实用提示（<=30字），保持与之前不同的措辞或风格，不要解释、不要多余文本、不要引号。" }
-                }
-            };
+            var body = BuildChatBody(
+                ("system", "你是友好的游戏助手。每次回复要保持表达多样性，避免重复之前在同一局或同一会话中使用过的整句或固定短语。可在风格上随机选择：幽默、直率、温和或简洁，但每次仅输出几句中文（不超过30字），内容须是具体的鼓励或可执行的小建议。不要解释、不要额外文本、不要引号。"),
+                ("user", stateSummary + " 请只输出几句中文鼓励或实用提示（<=30字），保持与之前不同的措辞或风格，不要解释、不要多余文本、不要引号.")
+            );
             return await PostAndExtractSingleLineAsync(body);
         }
 
@@ -506,15 +505,10 @@ namespace SnakeGame
         public async Task<string> GetInteractionOnEatAsync(string stateSummary)
         {
             // 吃到食物时的提示也应多样化，并可包含基于当前状态的小策略
-            var body = new
-            {
-                model = model,
-                messages = new object[]
-                {
-                    new { role = "system", content = "你是友好的游戏助手。吃到食物时要给出简短且多样化的几句中文提示（<=30字），可以是鼓励或基于当前局面的小策略。避免与本局之前的提示重复。不要解释、不要多余文本、不要引号。" },
-                    new { role = "user", content = stateSummary + " 请只输出几句中文鼓励或简短策略（<=30字），措辞要与之前不同，不要解释、不要多余文本、不要引号。" }
-                }
-            };
+            var body = BuildChatBody(
+                ("system", "你是友好的游戏助手。吃到食物时要给出简短且多样化的几句中文提示（<=30字），可以是鼓励或基于当前局面的小策略。避免与本局之前的提示重复。不要解释、不要多余文本、不要引号。"),
+                ("user", stateSummary + " 请只输出几句中文鼓励或简短策略（<=30字），措辞要与之前不同，不要解释、不要多余文本、不要引号.")
+            );
             return await PostAndExtractSingleLineAsync(body);
         }
 
@@ -522,15 +516,10 @@ namespace SnakeGame
         public async Task<string> GetFoodPositionAsync(List<Position> snakeBody)
         {
             string snakePositions = string.Join(";", snakeBody.Select(p => $"({p.X},{p.Y})"));
-            var body = new
-            {
-                model = model,
-                messages = new object[]
-                {
-                    new { role = "system", content = "你是游戏地图/关卡生成器。只返回坐标，不要说明。" },
-                    new { role = "user", content = $"贪吃蛇当前位置：{snakePositions}。请在1到19之间生成一个食物位置，格式 'X:数字,Y:数字' 或 '数字,数字'，只返回位置，不要其他说明。" }
-                }
-            };
+            var body = BuildChatBody(
+                ("system", "你是游戏地图/关卡生成器。只返回坐标，不要说明。"),
+                ("user", $"贪吃蛇当前位置：{snakePositions}。请在1到19之间生成一个食物位置，格式 'X:数字,Y:数字' 或 '数字,数字'，只返回位置，不要其他说明。")
+            );
             return await PostAndExtractAsync(body);
         }
 
@@ -538,16 +527,32 @@ namespace SnakeGame
         public async Task<string> GenerateSummaryAsync(string prompt)
         {
             // 要求复盘富有变化且具体：几句本局总结 + 若干可执行训练建议并标注优先级
-            var body = new
-            {
-                model = model,
-                messages = new object[]
-                {
-                    new { role = "system", content = "你是游戏教练。返回时请遵循：1) 用几句独特且具体的本局总结（避免通用模板和与之前重复的句子）；2) 给出2到3条可执行的长期训练建议，并为每条建议标注优先级（高/中/低）和简短原因。返回纯文本，结构清晰但不要包含多余闲话。" },
-                    new { role = "user", content = prompt }
-                }
-            };
+            var body = BuildChatBody(
+                ("system", "你是游戏教练。返回时请遵循：1) 用几句独特且具体的本局总结（避免通用模板和与之前重复的句子）；2) 给出2到3条可执行的长期训练建议，并为每条建议标注优先级（高/中/低）和简短原因。返回纯文本，结构清晰但不要包含多余闲话。"),
+                ("user", prompt)
+            );
             return await PostAndExtractAsync(body);
+        }
+
+        // Build a chat request body from role/content pairs
+        private object BuildChatBody(params (string role, string content)[] messages)
+        {
+            var msgs = messages.Select(m => new { role = m.role, content = m.content }).ToArray();
+            return new { model = model, messages = msgs };
+        }
+
+        // Centralized raw HTTP POST sender: returns raw response string
+        private async Task<string> SendRequestRawAsync(object body)
+        {
+            string payload = System.Text.Json.JsonSerializer.Serialize(body);
+            var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
+            req.Headers.Add("Authorization", $"Bearer {apiKey}");
+            req.Headers.Add("Accept", "application/json");
+
+            var resp = await client.SendAsync(req);
+            resp.EnsureSuccessStatusCode();
+            return await resp.Content.ReadAsStringAsync();
         }
 
         // POST and extract single-line short response (first sentence / first non-empty line)
@@ -555,15 +560,7 @@ namespace SnakeGame
         {
             try
             {
-                string payload = System.Text.Json.JsonSerializer.Serialize(body);
-                var content = new StringContent(payload, Encoding.UTF8, "application/json");
-                var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
-                req.Headers.Add("Authorization", $"Bearer {apiKey}");
-                req.Headers.Add("Accept", "application/json");
-
-                var resp = await client.SendAsync(req);
-                resp.EnsureSuccessStatusCode();
-                var raw = await resp.Content.ReadAsStringAsync();
+                var raw = await SendRequestRawAsync(body);
 
                 var extracted = ExtractTextFromApiResponse(raw).Trim();
                 if (string.IsNullOrWhiteSpace(extracted)) return "开始游戏吧！";
@@ -610,15 +607,7 @@ namespace SnakeGame
         {
             try
             {
-                string payload = System.Text.Json.JsonSerializer.Serialize(body);
-                var content = new StringContent(payload, Encoding.UTF8, "application/json");
-                var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
-                req.Headers.Add("Authorization", $"Bearer {apiKey}");
-                req.Headers.Add("Accept", "application/json");
-
-                var resp = await client.SendAsync(req);
-                resp.EnsureSuccessStatusCode();
-                var raw = await resp.Content.ReadAsStringAsync();
+                var raw = await SendRequestRawAsync(body);
                 return ExtractTextFromApiResponse(raw);
             }
             catch (Exception ex)
