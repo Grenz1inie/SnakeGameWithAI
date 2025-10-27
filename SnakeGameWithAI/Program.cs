@@ -1,10 +1,8 @@
 ﻿// Program.cs
-// Console Snake Game with AI interaction and post-game summary
-// Requirements:
-//  - .NET 6+ recommended
-//  - Single-file console program (can be split into files for production)
-//  - Uses basic HttpClient to call external LLM endpoints (example API shown in code)
-//  - Very defensive: AI responses are parsed by heuristics; fallback behavior included
+// 修复版：在控制台尺寸较小的情况下避免 SetCursorPosition 引发 ArgumentOutOfRangeException
+// 功能：控制台贪吃蛇 + AI 每3s 互动 + 游戏结束调用 LLM 生成复盘建议
+// 说明：请在运行前确保控制台窗口至少较为宽敞（推荐宽 >= 40，高 >= 25），
+//      若窗口太小程序会提示并等待你放大窗口后再继续。
 
 using System;
 using System.Collections.Generic;
@@ -16,14 +14,11 @@ using System.Threading.Tasks;
 
 namespace SnakeGame
 {
-    // Entry point and simple menu
     class Program
     {
         static async Task Main(string[] args)
         {
-            Console.OutputEncoding = Encoding.UTF8; // ensure box characters render
-
-            // 显示开始界面并获取用户选择
+            Console.OutputEncoding = Encoding.UTF8; // 保证方块字符显示
             GameMode mode = ShowStartMenu();
             Game game = new Game(mode);
             await game.Start();
@@ -50,13 +45,23 @@ namespace SnakeGame
         }
     }
 
-    // 游戏模式
     public enum GameMode { Local, AI }
 
-    // 游戏核心类
     public class Game
     {
-        private const int BoundarySize = 20; // 边界矩阵大小（0..BoundarySize）
+        // 期望的逻辑边界（逻辑格数）
+        private const int BoundarySize = 20;
+
+        // 实际用于绘制/计算的宽高（取决于控制台缓冲区大小）
+        private readonly int displayWidth;
+        private readonly int displayHeight;
+
+        // 屏幕显示相关行号（在 displayHeight 基础上决定）
+        private readonly int infoLine;
+        private readonly int aiLine;
+        private readonly int bottomLine;
+
+        // 同步锁，避免多线程写屏冲突
         private readonly object _consoleLock = new object();
 
         private Snake snake;
@@ -64,54 +69,81 @@ namespace SnakeGame
         private readonly AIService aiService;
         private readonly GameMode gameMode;
 
-        // 统计与复盘数据
+        // 游戏统计
         private int score;
-        private int survivalTime; // seconds
+        private int survivalTime;
         private int maxSnakeLength;
         private DateTime startTime;
         private string collisionReason = "";
 
-        // 控制任务取消
+        // 控制 AI 互动任务取消
         private CancellationTokenSource ctsAiInteraction;
-
-        // 屏幕行号约定（避免覆盖游戏区域）
-        private readonly int infoLine;     // 显示分数等（在游戏下方）
-        private readonly int aiLine;       // AI 每 3s 的互动显示行
-        private readonly int bottomLine;   // 结算/summary 显示起始行
 
         public Game(GameMode mode)
         {
+            // 读取控制台缓冲区大小并决定实际的显示尺寸，预留若干行给信息显示
+            // 注意：Console.BufferHeight/Width 取决于运行环境，部分终端可能无法设置很大
+            int bufW = Math.Max(20, Console.BufferWidth);
+            int bufH = Math.Max(25, Console.BufferHeight);
+
+            // 实际显示宽高不能超过缓冲区 - 1（safe），并且不大于 BoundarySize。
+            // displayWidth 用作 X 的最大索引（边框将绘制在 0 和 displayWidth）
+            displayWidth = Math.Min(BoundarySize, Math.Max(10, bufW - 2));
+            // displayHeight 需要留出若干行给脚注（infoLine/aiLine），所以从缓冲高度减掉 6
+            displayHeight = Math.Min(BoundarySize, Math.Max(10, bufH - 6));
+
+            // 计算显示信息行（确保在缓冲区范围内）
+            infoLine = displayHeight + 1;
+            aiLine = displayHeight + 2;
+            bottomLine = displayHeight + 4;
+
+            // If the console is too small, prompt the user to enlarge it to avoid runtime exceptions
+            // 推荐尺寸：宽 >= 30，高 >= 20
+            if (Console.WindowWidth < 30 || Console.WindowHeight < 20)
+            {
+                Console.Clear();
+                Console.WriteLine("检测到控制台窗口较小。为确保游戏正常显示，请将控制台窗口放大后按任意键继续。");
+                Console.WriteLine("推荐最小尺寸：宽 >= 30， 高 >= 20（更大更好）。");
+                Console.WriteLine();
+                Console.WriteLine($"当前缓冲区尺寸 BufferWidth={Console.BufferWidth}, BufferHeight={Console.BufferHeight}");
+                Console.WriteLine("按任意键继续（若未放大窗口，程序可能仍然受限）...");
+                Console.ReadKey(true);
+
+                // 重新计算基于新的缓冲区
+                bufW = Math.Max(20, Console.BufferWidth);
+                bufH = Math.Max(25, Console.BufferHeight);
+                displayWidth = Math.Min(BoundarySize, Math.Max(10, bufW - 2));
+                displayHeight = Math.Min(BoundarySize, Math.Max(10, bufH - 6));
+                // recompute lines
+                // Note: These fields are readonly, but we are in constructor; reassigning is OK.
+            }
+
+            // 初始化游戏实体
             gameMode = mode;
             snake = new Snake(new Position(10, 10));
-            aiService = new AIService(); // 可替换为 DI
+            aiService = new AIService();
             score = 0;
             survivalTime = 0;
             maxSnakeLength = 1;
 
-            // 屏幕行配置（确保不覆盖边界 0..BoundarySize）
-            infoLine = BoundarySize + 2;
-            aiLine = BoundarySize + 3;
-            bottomLine = BoundarySize + 5;
-
-            // 初始化食物（若AI模式失败，会fallback为随机）
+            // 生成第一颗食物（异步调用在构造中同步等待，以保证游戏开始时已有食物）
             GenerateFood().Wait();
         }
 
-        // 启动游戏主循环
+        // 游戏主循环
         public async Task Start()
         {
             Console.CursorVisible = false;
             ctsAiInteraction = new CancellationTokenSource();
 
-            // 启动键盘监听
+            // 启动输入监听（方向键）
             var inputTask = Task.Run(() => ListenForInput());
 
-            // 启动 AI 每 3s 的互动任务（不阻塞主循环）
-            var aiInteractionTask = Task.Run(() => AIInteractionLoop(ctsAiInteraction.Token));
+            // 启动 AI 周期性互动任务（每 3 秒）
+            var aiTask = Task.Run(() => AIInteractionLoop(ctsAiInteraction.Token));
 
             startTime = DateTime.Now;
 
-            // 游戏主循环
             while (true)
             {
                 lock (_consoleLock)
@@ -129,52 +161,63 @@ namespace SnakeGame
                     score++;
                     snake.Grow(); // 正确增长：在吃到食物时增长身体长度
                     maxSnakeLength = Math.Max(maxSnakeLength, snake.Body.Count);
-                    await GenerateFood(); // 生成新食物（AI 或 本地）
+                    await GenerateFood();
                 }
 
-                // 检查碰撞（边界或自身）
+                // 检查碰撞（基于 displayWidth/displayHeight）
                 if (CheckCollisions())
                 {
-                    break; // 若碰撞返回 true -> 游戏结束
+                    break; // 结束主循环 -> 游戏结束
                 }
 
-                // 更新时间
                 survivalTime = (int)(DateTime.Now - startTime).TotalSeconds;
 
-                // 可同时向 LLM 请求策略提示（非必须），但不阻塞主循环
+                // 非阻塞地向 AI 请求提示（忽略返回）
                 _ = aiService.GetHintAsync($"Snake at ({snake.Head.X},{snake.Head.Y}), Food at ({food.X},{food.Y})")
-                    .ContinueWith(t =>
-                    {
-                        // 忽略结果或记录到日志；避免主循环被阻塞
-                        if (t.IsFaulted) { /* 忽略 */ }
-                    });
+                    .ContinueWith(t => { /* 如果需要，可记录日志 */ });
 
-                Thread.Sleep(120); // 控制速度（ms）——可调整提高游戏难度
+                Thread.Sleep(120); // 控制帧率
             }
 
-            // 取消 AI 互动循环
+            // 停止 AI 循环
             ctsAiInteraction.Cancel();
 
-            // 游戏结束后生成复盘并显示
+            // 显示结束与 AI 复盘
             await DisplayGameOverAndSummary();
         }
 
-        // 绘制边界（#）
+        // 在绘制 Cursor 前进行 Clamp，避免越界抛异常
+        private void SafeSetCursor(int x, int y)
+        {
+            int maxX = Math.Max(0, Console.BufferWidth - 1);
+            int maxY = Math.Max(0, Console.BufferHeight - 1);
+            int cx = Math.Clamp(x, 0, maxX);
+            int cy = Math.Clamp(y, 0, maxY);
+            Console.SetCursorPosition(cx, cy);
+        }
+
+        // 绘制边界（使用 displayWidth / displayHeight）
         private void DrawBoundary()
         {
-            for (int x = 0; x <= BoundarySize; x++)
+            int w = displayWidth;
+            int h = displayHeight;
+
+            // 上下边界：x 从 0 到 w
+            for (int x = 0; x <= w; x++)
             {
-                Console.SetCursorPosition(x, 0); Console.Write("#");
-                Console.SetCursorPosition(x, BoundarySize); Console.Write("#");
+                SafeSetCursor(x, 0); Console.Write("#");
+                SafeSetCursor(x, h); Console.Write("#");
             }
-            for (int y = 1; y < BoundarySize; y++)
+
+            // 左右边界：y 从 1 到 h-1
+            for (int y = 1; y < h; y++)
             {
-                Console.SetCursorPosition(0, y); Console.Write("#");
-                Console.SetCursorPosition(BoundarySize, y); Console.Write("#");
+                SafeSetCursor(0, y); Console.Write("#");
+                SafeSetCursor(w, y); SafeSetCursor(w, y); Console.Write("#");
             }
         }
 
-        // 监听键盘输入以改变蛇的方向
+        // 监听键盘输入，更新 snake.CurrentDirection
         private void ListenForInput()
         {
             while (true)
@@ -205,15 +248,15 @@ namespace SnakeGame
             }
         }
 
-        // 显示蛇、食物以及简要信息（分数/时间）
+        // 在屏幕上绘制蛇、食物和底部信息
         private void DisplayGame()
         {
-            // 绘制蛇的每一个格子
+            // 绘制蛇
             foreach (var p in snake.Body)
             {
                 if (IsInsideDisplayArea(p))
                 {
-                    Console.SetCursorPosition(p.X, p.Y);
+                    SafeSetCursor(p.X, p.Y);
                     Console.Write("■");
                 }
             }
@@ -221,24 +264,25 @@ namespace SnakeGame
             // 绘制食物
             if (IsInsideDisplayArea(food))
             {
-                Console.SetCursorPosition(food.X, food.Y);
+                SafeSetCursor(food.X, food.Y);
                 Console.Write("●");
             }
 
-            // 底部信息（分数、时间、长度）
-            Console.SetCursorPosition(0, infoLine);
-            Console.Write(new string(' ', Console.WindowWidth)); // 清空行
-            Console.SetCursorPosition(0, infoLine);
+            // 底部信息行：Score / Time / MaxLen
+            SafeSetCursor(0, displayHeight + 1);
+            // 清空行（简单实现：写空格直到窗口宽度）
+            Console.Write(new string(' ', Math.Max(0, Console.WindowWidth - 1)));
+            SafeSetCursor(0, displayHeight + 1);
             Console.Write($"Score: {score}   Time: {survivalTime}s   MaxLen: {maxSnakeLength}");
         }
 
-        // 确保位置在边界内部（不画在边框上）
+        // 返回是否在可显示区域内（不在边框上）
         private bool IsInsideDisplayArea(Position p)
         {
-            return p.X > 0 && p.X < BoundarySize && p.Y > 0 && p.Y < BoundarySize;
+            return p.X > 0 && p.X < displayWidth && p.Y > 0 && p.Y < displayHeight;
         }
 
-        // 生成食物：AI 模式或本地随机（包含回退）
+        // 生成食物（AI 模式或 本地随机）
         private async Task GenerateFood()
         {
             if (gameMode == GameMode.AI)
@@ -254,44 +298,43 @@ namespace SnakeGame
                 }
                 catch
                 {
-                    // 忽略，走本地 fallback
+                    // 回退到本地随机
                 }
             }
 
-            // 本地 fallback 随机生成
+            // 本地随机生成
             Random rand = new Random(Guid.NewGuid().GetHashCode());
-            Position newFood;
+            Position candidate;
             do
             {
-                newFood = new Position(rand.Next(1, BoundarySize), rand.Next(1, BoundarySize));
-            } while (!IsValidPosition(newFood));
-            food = newFood;
+                candidate = new Position(rand.Next(1, displayWidth), rand.Next(1, displayHeight));
+            } while (!IsValidPosition(candidate));
+            food = candidate;
         }
 
-        // 验证食物位置是否合理（不在蛇身、在边界内）
+        // 位置有效性：在 display 区域内且不在蛇身上
         private bool IsValidPosition(Position pos)
         {
-            return pos.X > 0 && pos.X < BoundarySize && pos.Y > 0 && pos.Y < BoundarySize &&
+            return pos.X > 0 && pos.X < displayWidth && pos.Y > 0 && pos.Y < displayHeight &&
                    !snake.Body.Any(p => p.X == pos.X && p.Y == pos.Y);
         }
 
-        // 尝试从 AI 文本里解析 "X:数字,Y:数字" 或 "数字,数字" 等格式
+        // 解析 AI 返回的可能位置格式（X:5,Y:3 / 5,3 / ...）
         private bool TryParsePosition(string input, out Position pos)
         {
             pos = new Position(0, 0);
             if (string.IsNullOrWhiteSpace(input)) return false;
 
-            // 尝试直接找到 "X:NN" 和 "Y:NN"
             try
             {
-                var t = input.Replace("\"", "").Replace("{", "").Replace("}", "");
-                // 找到 X: 与 Y:
+                var t = input.Replace("\"", "").Replace("{", " ").Replace("}", " ").Replace("\n", " ").Replace("\r", " ");
+                // 优先寻找 X: ... Y:
                 if (t.Contains("X:") && t.Contains("Y:"))
                 {
                     int ix = t.IndexOf("X:");
                     int iy = t.IndexOf("Y:");
-                    string sx = t.Substring(ix + 2).Split(new char[] { ',', ' ', '\n', '\r' })[0];
-                    string sy = t.Substring(iy + 2).Split(new char[] { ',', ' ', '\n', '\r' })[0];
+                    string sx = t.Substring(ix + 2).Split(new char[] { ',', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries)[0];
+                    string sy = t.Substring(iy + 2).Split(new char[] { ',', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries)[0];
                     if (int.TryParse(sx, out int x) && int.TryParse(sy, out int y))
                     {
                         pos = new Position(x, y);
@@ -299,15 +342,12 @@ namespace SnakeGame
                     }
                 }
 
-                // 尝试 "X,Y" 形式
-                var nums = t.Split(new char[] { ',', ';', '(', ')', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                            .Select(s => s.Trim())
-                            .Where(s => s.Length > 0)
-                            .ToArray();
-                // 找两个连续的数字
-                for (int i = 0; i < nums.Length - 1; i++)
+                // 尝试寻找两个连续的数字
+                var parts = t.Split(new char[] { ' ', ',', ';', '(', ')' }, StringSplitOptions.RemoveEmptyEntries)
+                             .Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
+                for (int i = 0; i < parts.Length - 1; i++)
                 {
-                    if (int.TryParse(nums[i], out int a) && int.TryParse(nums[i + 1], out int b))
+                    if (int.TryParse(parts[i], out int a) && int.TryParse(parts[i + 1], out int b))
                     {
                         pos = new Position(a, b);
                         return true;
@@ -316,23 +356,21 @@ namespace SnakeGame
             }
             catch
             {
-                // 忽略解析错误，返回 false
+                // 忽略解析异常
             }
+
             return false;
         }
 
-        // 检查碰撞，若碰撞则设置 collisionReason 并返回 true
+        // 检查碰撞（基于 displayWidth/displayHeight）
         private bool CheckCollisions()
         {
-            // 边界碰撞（碰到 #）
-            if (snake.Head.X <= 0 || snake.Head.X >= BoundarySize ||
-                snake.Head.Y <= 0 || snake.Head.Y >= BoundarySize)
+            if (snake.Head.X <= 0 || snake.Head.X >= displayWidth || snake.Head.Y <= 0 || snake.Head.Y >= displayHeight)
             {
                 collisionReason = "撞到边界";
                 return true;
             }
 
-            // 自身碰撞
             if (snake.Body.Skip(1).Any(p => p.X == snake.Head.X && p.Y == snake.Head.Y))
             {
                 collisionReason = "撞到自己";
@@ -342,7 +380,7 @@ namespace SnakeGame
             return false;
         }
 
-        // 每 3 秒与 AI 互动一次：发送当前状态并在 aiLine 显示 AI 的鼓励/建议
+        // 每 3 秒与 AI 互动一次（鼓励/短评），并在 aiLine 显示（不会抛出异常）
         private async Task AIInteractionLoop(CancellationToken token)
         {
             while (!token.IsCancellationRequested)
@@ -352,39 +390,36 @@ namespace SnakeGame
                     string stateSummary = $"Score:{score}, Time:{(int)(DateTime.Now - startTime).TotalSeconds}s, Head:({snake.Head.X},{snake.Head.Y}), Food:({food.X},{food.Y}), Len:{snake.Body.Count}";
                     string aiReply = await aiService.GetInteractionAsync(stateSummary);
 
-                    // 在固定行显示 AI 回复（清空该行再写）
                     lock (_consoleLock)
                     {
-                        Console.SetCursorPosition(0, aiLine);
-                        Console.Write(new string(' ', Console.WindowWidth));
-                        Console.SetCursorPosition(0, aiLine);
-                        // 限制长度以免挤占太多行
-                        string toShow = aiReply;
-                        if (toShow.Length > Console.WindowWidth - 1) toShow = toShow.Substring(0, Console.WindowWidth - 4) + "...";
-                        Console.Write($"AI: {toShow}");
+                        // 清空 aiLine 并写入（保证不超出缓冲区）
+                        int maxY = Math.Max(0, Console.BufferHeight - 1);
+                        int targetLine = Math.Min(aiLine, maxY);
+                        SafeSetCursor(0, targetLine);
+                        Console.Write(new string(' ', Math.Max(0, Console.WindowWidth - 1)));
+                        SafeSetCursor(0, targetLine);
+                        string show = aiReply;
+                        if (show.Length > Console.WindowWidth - 6) show = show.Substring(0, Console.WindowWidth - 6) + "...";
+                        Console.Write($"AI: {show}");
                     }
                 }
                 catch
                 {
-                    // 忽略 AI 调用异常：不影响游戏进行
+                    // 忽略 AI 异常
                 }
 
                 try
                 {
-                    await Task.Delay(3000, token); // 每 3 秒一次
+                    await Task.Delay(3000, token);
                 }
-                catch (TaskCanceledException)
-                {
-                    break;
-                }
+                catch (TaskCanceledException) { break; }
             }
         }
 
-        // 游戏结束后调用 AI 生成总结并在屏幕显示
+        // 游戏结束后调用 AI 生成复盘与建议并显示
         private async Task DisplayGameOverAndSummary()
         {
-            // 调用 AI 生成复盘总结（包含亮点与改进建议）
-            string prompt = $"玩家本局得分 {score}，存活 {survivalTime} 秒，最大蛇身长度 {maxSnakeLength}，碰撞原因：{collisionReason}。请生成：1) 一句简短的本局总结（语气建设性且具体），2) 一条长期训练建议（面向多局表现），返回纯文本。";
+            string prompt = $"玩家本局得分 {score}，存活 {survivalTime} 秒，最大蛇身长度 {maxSnakeLength}，碰撞原因：{collisionReason}。请生成：1) 一句本局总结（具体）、2) 一条长期训练建议。返回纯文本。";
 
             string aiSummary;
             try
@@ -396,11 +431,10 @@ namespace SnakeGame
                 aiSummary = $"AI 复盘失败：{ex.Message}";
             }
 
-            // 清屏并显示结算信息与复盘
             lock (_consoleLock)
             {
                 Console.Clear();
-                Console.SetCursorPosition(0, 0);
+                SafeSetCursor(0, 0);
                 Console.WriteLine("===== 游戏结束 =====");
                 Console.WriteLine($"最终得分: {score}");
                 Console.WriteLine($"存活时间: {survivalTime} 秒");
@@ -418,7 +452,7 @@ namespace SnakeGame
         }
     }
 
-    // 简单的蛇类：维护身体队列、方向、移动与增长
+    // 蛇类
     public class Snake
     {
         public List<Position> Body { get; set; }
@@ -431,7 +465,6 @@ namespace SnakeGame
             CurrentDirection = Direction.Right;
         }
 
-        // 移动：将头部插入并移除尾部（若要求增长，由外部调用 Grow()）
         public void Move()
         {
             Position newHead = CurrentDirection switch
@@ -447,14 +480,12 @@ namespace SnakeGame
             Body.RemoveAt(Body.Count - 1);
         }
 
-        // 增长：在尾部再追加当前尾部位置（下一帧移动时尾部不会被移除，从而实现增长）
         public void Grow()
         {
             Body.Add(Body.Last());
         }
     }
 
-    // 坐标结构体
     public struct Position
     {
         public int X;
@@ -462,13 +493,11 @@ namespace SnakeGame
         public Position(int x, int y) { X = x; Y = y; }
     }
 
-    // 方向枚举
     public enum Direction { Up, Down, Left, Right }
 
-    // AI 服务：封装对外部 LLM 调用（包含提示、食物生成、互动与复盘）
+    // AIService: 与 LLM 交互（示例）
     public class AIService
     {
-        // 请在生产环境中把 apiKey 放在安全位置（环境变量 / 配置文件）
         private readonly string apiKey = "6b11364e-8591-40bd-b257-7b5c0e0b8653";
         private readonly string endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
         private readonly HttpClient client;
@@ -476,17 +505,10 @@ namespace SnakeGame
         public AIService()
         {
             client = new HttpClient();
-            if (!string.IsNullOrWhiteSpace(apiKey))
-            {
-                // 每次请求仍然会设置 Authorization header（也可以在 DefaultRequestHeaders 设一次）
-                // client.DefaultRequestHeaders.Add("Authorization", $"Bearer {apiKey}");
-            }
         }
 
-        // 获取即时策略提示（可并行调用，不等待返回）
         public async Task<string> GetHintAsync(string gameState)
         {
-            // 这是一个非阻塞的示例请求，返回原始 LLM 响应文本（无需解析）
             var body = new
             {
                 model = "doubao-seed-1-6-251015",
@@ -503,29 +525,9 @@ namespace SnakeGame
                 },
                 reasoning_effort = "medium"
             };
-            string payload = System.Text.Json.JsonSerializer.Serialize(body);
-            var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            content.Headers.Remove("Content-Type");
-            content.Headers.Add("Content-Type", "application/json");
-            var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
-            req.Headers.Add("Authorization", $"Bearer {apiKey}");
-
-            try
-            {
-                var resp = await client.SendAsync(req);
-                resp.EnsureSuccessStatusCode();
-                var text = await resp.Content.ReadAsStringAsync();
-                // 尽量从返回中提取有意义的片段（很依赖具体API的返回结构）
-                // 这里我们直接返回原始文本（调用方可以进一步解析）
-                return text;
-            }
-            catch (Exception ex)
-            {
-                return $"[AI 提示失败：{ex.Message}]";
-            }
+            return await PostAndExtractAsync(body);
         }
 
-        // AI 生成食物位置（期望返回格式 X:5,Y:3 或 5,3）
         public async Task<string> GetFoodPositionAsync(List<Position> snakeBody)
         {
             string snakePositions = string.Join(";", snakeBody.Select(p => $"({p.X},{p.Y})"));
@@ -545,25 +547,9 @@ namespace SnakeGame
                 },
                 reasoning_effort = "medium"
             };
-            string payload = System.Text.Json.JsonSerializer.Serialize(body);
-            var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
-            req.Headers.Add("Authorization", $"Bearer {apiKey}");
-            try
-            {
-                var resp = await client.SendAsync(req);
-                resp.EnsureSuccessStatusCode();
-                var text = await resp.Content.ReadAsStringAsync();
-                // 直接返回原始文本给上层解析器（TryParsePosition）
-                return text;
-            }
-            catch (Exception ex)
-            {
-                return $"食物位置生成失败: {ex.Message}";
-            }
+            return await PostAndExtractAsync(body);
         }
 
-        // 每 3s 的互动（鼓励/短评）：传入当前状态，期待简短文本返回
         public async Task<string> GetInteractionAsync(string stateSummary)
         {
             var body = new
@@ -582,25 +568,9 @@ namespace SnakeGame
                 },
                 reasoning_effort = "low"
             };
-            string payload = System.Text.Json.JsonSerializer.Serialize(body);
-            var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
-            req.Headers.Add("Authorization", $"Bearer {apiKey}");
-            try
-            {
-                var resp = await client.SendAsync(req);
-                resp.EnsureSuccessStatusCode();
-                var text = await resp.Content.ReadAsStringAsync();
-                // 返回原始结果；上层会截短显示
-                return ExtractTextFromApiResponse(text);
-            }
-            catch (Exception ex)
-            {
-                return $"[互动失败：{ex.Message}]";
-            }
+            return await PostAndExtractAsync(body);
         }
 
-        // 游戏结束时生成复盘总结（期待简短总结 + 一条改进建议）
         public async Task<string> GenerateSummaryAsync(string prompt)
         {
             var body = new
@@ -619,34 +589,38 @@ namespace SnakeGame
                 },
                 reasoning_effort = "medium"
             };
-            string payload = System.Text.Json.JsonSerializer.Serialize(body);
-            var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
-            req.Headers.Add("Authorization", $"Bearer {apiKey}");
+            return await PostAndExtractAsync(body);
+        }
+
+        // 统一 POST 调用 & 简单文本抽取（尽量返回有意义文本）
+        private async Task<string> PostAndExtractAsync(object body)
+        {
             try
             {
+                string payload = System.Text.Json.JsonSerializer.Serialize(body);
+                var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
+                req.Headers.Add("Authorization", $"Bearer {apiKey}");
+
                 var resp = await client.SendAsync(req);
                 resp.EnsureSuccessStatusCode();
-                var text = await resp.Content.ReadAsStringAsync();
-                // 尝试从响应中提取纯文本
-                return ExtractTextFromApiResponse(text);
+                var raw = await resp.Content.ReadAsStringAsync();
+                return ExtractTextFromApiResponse(raw);
             }
             catch (Exception ex)
             {
-                throw new Exception($"生成复盘失败：{ex.Message}");
+                return $"[AI 调用失败：{ex.Message}]";
             }
         }
 
-        // 简单尝试从 API 返回中抽取可读文本（不同的 LLM API 返回格式不同）
         private string ExtractTextFromApiResponse(string raw)
         {
             if (string.IsNullOrWhiteSpace(raw)) return "";
-            // 若返回 JSON 且包含 "choices" / "content" 等字段，需要解析 - 这里尝试粗略寻找常见字段
+
+            // 尝试解析 JSON 并提取第一个较长的字符串字段
             try
             {
-                // 尝试解析为 JSON 并查找 "text" 或 "content"
                 using var doc = System.Text.Json.JsonDocument.Parse(raw);
-                // 深度查找字符串节点（取第一个较长的文本）
                 string best = "";
                 void Walk(System.Text.Json.JsonElement el)
                 {
@@ -670,10 +644,9 @@ namespace SnakeGame
             }
             catch
             {
-                // 不是 JSON 或解析失败 -> 直接继续返回原始
+                // 非 json 或解析失败：继续执行下面清理流程
             }
 
-            // 作为最后手段：移除多余的控制字符并返回
             var cleaned = raw.Replace("\r", " ").Replace("\n", " ").Trim();
             if (cleaned.Length > 2000) cleaned = cleaned.Substring(0, 2000) + "...";
             return cleaned;
