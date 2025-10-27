@@ -1,7 +1,11 @@
 ﻿// Program.cs
-// Console Snake Game - AI prompts adjusted to force the model to output a single short sentence (no explanation).
-// Usage: .NET 6+
-// 注意：为简便示例，API Key 仍写在代码中。生产环境请使用环境变量或配置文件存储密钥。
+// Console Snake Game with AI interaction only at:
+//  1) game start
+//  2) when the snake eats food
+//  3) at game over (detailed summary)
+// Model/configuration for LLM is centralized at the top of AIService.
+// Uses model "doubao-1-5-lite-32k-250115" per your request.
+// .NET 6+ recommended.
 
 using System;
 using System.Collections.Generic;
@@ -102,7 +106,7 @@ namespace SnakeGame
             // 1) AI at game start — request a single short sentence (no explanation)
             try
             {
-                string startPrompt = $"游戏开始。模式={gameMode}。请只输出一句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
+                string startPrompt = $"游戏开始。模式={gameMode}。请只输出几句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
                 lastAiMessage = await aiService.GetInteractionOnceAsync(startPrompt);
             }
             catch
@@ -133,7 +137,7 @@ namespace SnakeGame
                     // 2) AI on eating food — request a single short sentence (no explanation)
                     try
                     {
-                        string state = $"玩家吃到食物。Score={score}, Time={(int)(DateTime.Now - startTime).TotalSeconds}s, Head=({snake.Head.X},{snake.Head.Y}). 请只输出一句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
+                        string state = $"玩家吃到食物。Score={score}, Time={(int)(DateTime.Now - startTime).TotalSeconds}s, Head=({snake.Head.X},{snake.Head.Y}). 请只输出几句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
                         string aiReply = await aiService.GetInteractionOnEatAsync(state);
                         lastAiMessage = aiReply;
                         lock (_consoleLock)
@@ -160,7 +164,7 @@ namespace SnakeGame
             }
 
             // 3) AI at game over — detailed summary (can be multi-sentence)
-            string summaryPrompt = $"玩家本局得分 {score}，存活 {survivalTime} 秒，最大蛇身长度 {maxSnakeLength}，碰撞原因：{collisionReason}。请生成：1) 一句本局总结（简明具体），2) 一条长期训练建议。返回纯文本。";
+            string summaryPrompt = $"玩家本局得分 {score}，存活 {survivalTime} 秒，最大蛇身长度 {maxSnakeLength}，碰撞原因：{collisionReason}。请生成：1) 几句本局总结（简明具体），2) 一条长期训练建议。返回纯文本。";
             string aiSummary;
             try
             {
@@ -371,6 +375,8 @@ namespace SnakeGame
         public List<Position> Body { get; set; }
         public Position Head => Body.First();
         public Direction CurrentDirection { get; set; }
+        // When true, the next Move() will grow the snake (i.e. not remove the tail)
+        private bool pendingGrow = false;
 
         public Snake(Position spawn)
         {
@@ -389,22 +395,37 @@ namespace SnakeGame
                 _ => Head
             };
             Body.Insert(0, newHead);
-            Body.RemoveAt(Body.Count - 1);
+            // If a grow was requested, do not remove the tail this move (length increases by 1)
+            if (pendingGrow)
+            {
+                pendingGrow = false;
+            }
+            else
+            {
+                Body.RemoveAt(Body.Count - 1);
+            }
         }
 
         public void Grow()
         {
-            Body.Add(Body.Last());
+            // Mark that the snake should grow on the next Move() by preserving the tail
+            // This avoids duplicating the head when the snake length is 1.
+            pendingGrow = true;
         }
     }
 
     public struct Position { public int X; public int Y; public Position(int x, int y) { X = x; Y = y; } }
     public enum Direction { Up, Down, Left, Right }
 
+    // AIService: centralized model/configuration and API calls
     public class AIService
     {
+        // --- Unified model configuration (change here to switch model) ---
+        private readonly string model = "doubao-1-5-lite-32k-250115";
         private readonly string apiKey = "6b11364e-8591-40bd-b257-7b5c0e0b8653";
         private readonly string endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
+        // ----------------------------------------------------------------
+
         private readonly HttpClient client;
 
         public AIService()
@@ -412,96 +433,71 @@ namespace SnakeGame
             client = new HttpClient();
         }
 
-        // Start prompt: force direct single-sentence output
+        // Called once at game start: force single-shot short reply
         public async Task<string> GetInteractionOnceAsync(string stateSummary)
         {
+            // 系统提示加强：要求多样性、避免重复、限制长度并提供风格选项
             var body = new
             {
-                model = "doubao-seed-1-6-251015",
-                max_completion_tokens = 80,
+                model = model,
                 messages = new object[]
                 {
-                    new {
-                        role = "user",
-                        content = new object[]
-                        {
-                            new { text = $"{stateSummary} 请只输出一句中文鼓励或实用提示，**不要解释、不用展示思考过程、不要多余文本、不要引号**。", type = "text" }
-                        }
-                    }
-                },
-                reasoning_effort = "low"
+                    new { role = "system", content = "你是友好的游戏助手。每次回复要保持表达多样性，避免重复之前在同一局或同一会话中使用过的整句或固定短语。可在风格上随机选择：幽默、直率、温和或简洁，但每次仅输出几句中文（不超过30字），内容须是具体的鼓励或可执行的小建议。不要解释、不要额外文本、不要引号。" },
+                    new { role = "user", content = stateSummary + " 请只输出几句中文鼓励或实用提示（<=30字），保持与之前不同的措辞或风格，不要解释、不要多余文本、不要引号。" }
+                }
             };
             return await PostAndExtractSingleLineAsync(body);
         }
 
-        // On-eat prompt: force direct single-sentence output
+        // Called when snake eats food: one-shot short reply
         public async Task<string> GetInteractionOnEatAsync(string stateSummary)
         {
+            // 吃到食物时的提示也应多样化，并可包含基于当前状态的小策略
             var body = new
             {
-                model = "doubao-seed-1-6-251015",
-                max_completion_tokens = 80,
+                model = model,
                 messages = new object[]
                 {
-                    new {
-                        role = "user",
-                        content = new object[]
-                        {
-                            new { text = $"{stateSummary} 请只输出一句中文鼓励或实用提示，**不要解释、不用展示思考过程、不要多余文本、不要引号**。", type = "text" }
-                        }
-                    }
-                },
-                reasoning_effort = "low"
+                    new { role = "system", content = "你是友好的游戏助手。吃到食物时要给出简短且多样化的几句中文提示（<=30字），可以是鼓励或基于当前局面的小策略。避免与本局之前的提示重复。不要解释、不要多余文本、不要引号。" },
+                    new { role = "user", content = stateSummary + " 请只输出几句中文鼓励或简短策略（<=30字），措辞要与之前不同，不要解释、不要多余文本、不要引号。" }
+                }
             };
             return await PostAndExtractSingleLineAsync(body);
         }
 
-        // Generate food position (unchanged)
+        // Ask AI for a food position (AI should return a simple position string)
         public async Task<string> GetFoodPositionAsync(List<Position> snakeBody)
         {
             string snakePositions = string.Join(";", snakeBody.Select(p => $"({p.X},{p.Y})"));
             var body = new
             {
-                model = "doubao-seed-1-6-251015",
-                max_completion_tokens = 200,
+                model = model,
                 messages = new object[]
                 {
-                    new {
-                        role = "user",
-                        content = new object[]
-                        {
-                            new { text = $"贪吃蛇当前位置：{snakePositions}。请在1到19之间生成一个食物位置，格式 'X:数字,Y:数字' 或 '数字,数字'，只返回位置，不要其他说明。", type = "text" }
-                        }
-                    }
-                },
-                reasoning_effort = "medium"
+                    new { role = "system", content = "你是游戏地图/关卡生成器。只返回坐标，不要说明。" },
+                    new { role = "user", content = $"贪吃蛇当前位置：{snakePositions}。请在1到19之间生成一个食物位置，格式 'X:数字,Y:数字' 或 '数字,数字'，只返回位置，不要其他说明。" }
+                }
             };
             return await PostAndExtractAsync(body);
         }
 
-        // Generate summary at gameover (can be multi-sentence)
+        // Generate a detailed summary at game over
         public async Task<string> GenerateSummaryAsync(string prompt)
         {
+            // 要求复盘富有变化且具体：几句本局总结 + 若干可执行训练建议并标注优先级
             var body = new
             {
-                model = "doubao-seed-1-6-251015",
-                max_completion_tokens = 800,
+                model = model,
                 messages = new object[]
                 {
-                    new {
-                        role = "user",
-                        content = new object[]
-                        {
-                            new { text = prompt, type = "text" }
-                        }
-                    }
-                },
-                reasoning_effort = "medium"
+                    new { role = "system", content = "你是游戏教练。返回时请遵循：1) 用几句独特且具体的本局总结（避免通用模板和与之前重复的句子）；2) 给出2到3条可执行的长期训练建议，并为每条建议标注优先级（高/中/低）和简短原因。返回纯文本，结构清晰但不要包含多余闲话。" },
+                    new { role = "user", content = prompt }
+                }
             };
             return await PostAndExtractAsync(body);
         }
 
-        // Post and extract single-line response: prefer a single short string (no explanation)
+        // POST and extract single-line short response (first sentence / first non-empty line)
         private async Task<string> PostAndExtractSingleLineAsync(object body)
         {
             try
@@ -510,36 +506,43 @@ namespace SnakeGame
                 var content = new StringContent(payload, Encoding.UTF8, "application/json");
                 var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
                 req.Headers.Add("Authorization", $"Bearer {apiKey}");
+                req.Headers.Add("Accept", "application/json");
 
                 var resp = await client.SendAsync(req);
                 resp.EnsureSuccessStatusCode();
                 var raw = await resp.Content.ReadAsStringAsync();
 
-                // Try to extract likely answer string
                 var extracted = ExtractTextFromApiResponse(raw).Trim();
+                if (string.IsNullOrWhiteSpace(extracted)) return "开始游戏吧！";
 
-                // If extracted contains multiple sentences or long explanation, take first sentence/line
-                if (string.IsNullOrWhiteSpace(extracted)) return "";
-                // Split by common sentence delimiters, prefer the first non-empty
-                var candidates = extracted.Split(new[] { '\n', '.', '。', '!', '！' }, StringSplitOptions.RemoveEmptyEntries)
+                // 验证是否是合理的中文文本(至少包含一些中文字符)
+                bool hasChineseChar = extracted.Any(c => c >= 0x4E00 && c <= 0x9FFF);
+                // 过滤掉看起来像哈希值或ID的字符串(纯十六进制字符串)
+                bool looksLikeHash = extracted.Length > 20 && 
+                                    extracted.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+                
+                if (looksLikeHash || !hasChineseChar)
+                {
+                    return "开始游戏吧！"; // 使用默认鼓励语
+                }
+
+                // Split into candidate lines/sentences, pick the first sensible one
+                var candidates = extracted.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                          .SelectMany(line => line.Split(new[] { '。', '.', '!', '！' }, StringSplitOptions.RemoveEmptyEntries))
                                           .Select(s => s.Trim())
                                           .Where(s => s.Length > 0)
                                           .ToArray();
                 if (candidates.Length > 0)
                 {
-                    // Return first candidate as the single-line message
                     string one = candidates[0];
-                    // Remove surrounding quotes if present
+                    // Remove surrounding quotes if any
                     if ((one.StartsWith("\"") && one.EndsWith("\"")) || (one.StartsWith("“") && one.EndsWith("”")))
-                    {
                         one = one.Substring(1, one.Length - 2);
-                    }
-                    // Final safety: ensure not too long
                     if (one.Length > 120) one = one.Substring(0, 117) + "...";
                     return one;
                 }
 
-                // fallback to truncated raw
+                // fallback: truncated raw
                 if (extracted.Length > 120) return extracted.Substring(0, 117) + "...";
                 return extracted;
             }
@@ -558,6 +561,7 @@ namespace SnakeGame
                 var content = new StringContent(payload, Encoding.UTF8, "application/json");
                 var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
                 req.Headers.Add("Authorization", $"Bearer {apiKey}");
+                req.Headers.Add("Accept", "application/json");
 
                 var resp = await client.SendAsync(req);
                 resp.EnsureSuccessStatusCode();
@@ -577,20 +581,45 @@ namespace SnakeGame
             try
             {
                 using var doc = System.Text.Json.JsonDocument.Parse(raw);
+                
+                // 首先尝试标准的 OpenAI/豆包 API 格式: choices[0].message.content
+                if (doc.RootElement.TryGetProperty("choices", out var choices) && 
+                    choices.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    var firstChoice = choices.EnumerateArray().FirstOrDefault();
+                    if (firstChoice.ValueKind != System.Text.Json.JsonValueKind.Undefined &&
+                        firstChoice.TryGetProperty("message", out var message) &&
+                        message.TryGetProperty("content", out var content))
+                    {
+                        var text = content.GetString();
+                        if (!string.IsNullOrWhiteSpace(text)) return text;
+                    }
+                }
+                
+                // 备用方案：遍历所有字符串字段，但要排除 id、model 等元数据字段
                 string best = "";
-                void Walk(System.Text.Json.JsonElement el)
+                HashSet<string> excludeKeys = new HashSet<string> { "id", "model", "object", "role", "finish_reason", "service_tier" };
+                
+                void Walk(System.Text.Json.JsonElement el, string currentKey = "")
                 {
                     switch (el.ValueKind)
                     {
                         case System.Text.Json.JsonValueKind.String:
                             var s = el.GetString();
-                            if (!string.IsNullOrWhiteSpace(s) && s.Length > best.Length) best = s;
+                            if (!string.IsNullOrWhiteSpace(s) && 
+                                !excludeKeys.Contains(currentKey) &&
+                                s.Length > best.Length) 
+                            {
+                                best = s;
+                            }
                             break;
                         case System.Text.Json.JsonValueKind.Object:
-                            foreach (var p in el.EnumerateObject()) Walk(p.Value);
+                            foreach (var p in el.EnumerateObject()) 
+                                Walk(p.Value, p.Name);
                             break;
                         case System.Text.Json.JsonValueKind.Array:
-                            foreach (var e in el.EnumerateArray()) Walk(e);
+                            foreach (var e in el.EnumerateArray()) 
+                                Walk(e, currentKey);
                             break;
                         default: break;
                     }
@@ -598,7 +627,10 @@ namespace SnakeGame
                 Walk(doc.RootElement);
                 if (!string.IsNullOrWhiteSpace(best)) return best;
             }
-            catch { /* not json or parse failed */ }
+            catch
+            {
+                // not JSON or parse failed -> fallback to raw cleaning
+            }
 
             var cleaned = raw.Replace("\r", " ").Replace("\n", " ").Trim();
             if (cleaned.Length > 2000) cleaned = cleaned.Substring(0, 2000) + "...";
