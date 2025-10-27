@@ -1,9 +1,7 @@
 ﻿// Program.cs
-// Console Snake Game with AI calls only at:
-//  1) game start
-//  2) when the snake eats food
-//  3) at game over (detailed summary)
-// AI messages written to a persistent AI line that is reprinted every frame so they won't be lost.
+// Console Snake Game - AI prompts adjusted to force the model to output a single short sentence (no explanation).
+// Usage: .NET 6+
+// 注意：为简便示例，API Key 仍写在代码中。生产环境请使用环境变量或配置文件存储密钥。
 
 using System;
 using System.Collections.Generic;
@@ -50,17 +48,12 @@ namespace SnakeGame
 
     public class Game
     {
-        // Logical grid size (maximum). Actual drawing clamps to console buffer.
         private const int LogicalBoundary = 20;
-
-        // Actual drawing extents based on console buffer/window to avoid out-of-range
         private int displayWidth;
         private int displayHeight;
-
-        // Lines reserved for info and AI persistent message and final summary
-        private int infoLine;          // score/time line
-        private int aiPersistentLine;  // persistent AI interaction line (re-drawn every frame)
-        private int summaryStartLine;  // where final summary is printed
+        private int infoLine;
+        private int aiPersistentLine;
+        private int summaryStartLine;
 
         private readonly object _consoleLock = new object();
 
@@ -69,14 +62,13 @@ namespace SnakeGame
         private readonly AIService aiService;
         private readonly GameMode gameMode;
 
-        // Stats
         private int score;
         private int survivalTime;
         private int maxSnakeLength;
         private DateTime startTime;
         private string collisionReason = "";
 
-        // Last persistent AI message (set at start and on each food-eaten event)
+        // persistent AI message (won't be lost by Console.Clear as we reprint it)
         private string lastAiMessage = "";
 
         public Game(GameMode mode)
@@ -84,12 +76,9 @@ namespace SnakeGame
             gameMode = mode;
             aiService = new AIService();
 
-            // Initialize display dimensions safely based on current buffer/window
-            // Reserve a few lines at bottom for info and summary so we don't draw outside buffer.
             int bufW = Math.Max(20, Console.BufferWidth);
             int bufH = Math.Max(25, Console.BufferHeight);
 
-            // clamp to logical boundary, and leave lines for info
             displayWidth = Math.Min(LogicalBoundary, Math.Max(10, bufW - 2));
             displayHeight = Math.Min(LogicalBoundary, Math.Max(10, bufH - 6));
 
@@ -102,60 +91,54 @@ namespace SnakeGame
             survivalTime = 0;
             maxSnakeLength = 1;
 
-            // initial food
             GenerateFood().Wait();
         }
 
-        // Main startup + loop
         public async Task Start()
         {
             Console.CursorVisible = false;
             startTime = DateTime.Now;
 
-            // 1) Call AI once at game start (welcome / small tip)
+            // 1) AI at game start — request a single short sentence (no explanation)
             try
             {
-                string startPrompt = $"游戏开始：模式={gameMode}. 初始蛇头=({snake.Head.X},{snake.Head.Y}), 边界=1..{displayWidth - 1}";
+                string startPrompt = $"游戏开始。模式={gameMode}。请只输出一句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
                 lastAiMessage = await aiService.GetInteractionOnceAsync(startPrompt);
             }
             catch
             {
-                lastAiMessage = "[AI 暂不可用 - 使用本地提示]";
+                lastAiMessage = "[AI 暂不可用]";
             }
 
-            // Main loop variables
-            var inputTask = Task.Run(() => ListenForInput()); // keyboard listener
+            var inputTask = Task.Run(() => ListenForInput());
+
             while (true)
             {
                 lock (_consoleLock)
                 {
-                    Console.Clear();                     // clear whole screen but we will immediately re-print the AI persistent line
+                    Console.Clear();
                     DrawBoundary();
-                    DisplayGame();                       // draws snake & food & info
-                    // Reprint the persistent AI message AFTER clearing so it stays visible
-                    PrintPersistentAiLine();
+                    DisplayGame();
+                    PrintPersistentAiLine(); // ensure persistent AI message reprinted each frame
                 }
 
                 snake.Move();
 
-                // If eat food -> grow, update score, call AI once for feedback (and set lastAiMessage)
                 if (snake.Head.X == food.X && snake.Head.Y == food.Y)
                 {
                     score++;
                     snake.Grow();
                     maxSnakeLength = Math.Max(maxSnakeLength, snake.Body.Count);
 
-                    // call AI to get small immediate feedback and update persistent line (only now)
+                    // 2) AI on eating food — request a single short sentence (no explanation)
                     try
                     {
-                        string state = $"At eat: Score={score}, Time={(int)(DateTime.Now - startTime).TotalSeconds}s, Head=({snake.Head.X},{snake.Head.Y}), Len={snake.Body.Count}";
-                        string aiReply = await aiService.GetInteractionOnceAsync(state);
-                        // store persistent message and ensure it's displayed next frame (we also print immediately)
+                        string state = $"玩家吃到食物。Score={score}, Time={(int)(DateTime.Now - startTime).TotalSeconds}s, Head=({snake.Head.X},{snake.Head.Y}). 请只输出一句中文鼓励或实用提示（不要解释、不要多余文本、不要引号）。";
+                        string aiReply = await aiService.GetInteractionOnEatAsync(state);
                         lastAiMessage = aiReply;
                         lock (_consoleLock)
                         {
-                            // Immediately print (so player sees instant feedback without waiting next frame)
-                            PrintPersistentAiLine();
+                            PrintPersistentAiLine(); // immediately show it
                         }
                     }
                     catch
@@ -166,7 +149,6 @@ namespace SnakeGame
                     await GenerateFood();
                 }
 
-                // Check collisions
                 if (CheckCollisions())
                 {
                     break;
@@ -174,12 +156,11 @@ namespace SnakeGame
 
                 survivalTime = (int)(DateTime.Now - startTime).TotalSeconds;
 
-                // Minor delay
                 Thread.Sleep(120);
             }
 
-            // Game over - call AI for detailed summary (one call)
-            string summaryPrompt = $"玩家本局得分 {score}，存活 {survivalTime} 秒，最大蛇身长度 {maxSnakeLength}，碰撞原因：{collisionReason}。请生成：1) 一句简短的本局总结，2) 一条长期训练建议。返回纯文本。";
+            // 3) AI at game over — detailed summary (can be multi-sentence)
+            string summaryPrompt = $"玩家本局得分 {score}，存活 {survivalTime} 秒，最大蛇身长度 {maxSnakeLength}，碰撞原因：{collisionReason}。请生成：1) 一句本局总结（简明具体），2) 一条长期训练建议。返回纯文本。";
             string aiSummary;
             try
             {
@@ -190,7 +171,6 @@ namespace SnakeGame
                 aiSummary = $"AI 复盘失败：{ex.Message}";
             }
 
-            // Display final summary on reserved area
             lock (_consoleLock)
             {
                 Console.Clear();
@@ -211,7 +191,6 @@ namespace SnakeGame
             Environment.Exit(0);
         }
 
-        // Helper: safely set cursor without ArgumentOutOfRange
         private void SafeSetCursor(int x, int y)
         {
             int maxX = Math.Max(0, Console.BufferWidth - 1);
@@ -221,7 +200,6 @@ namespace SnakeGame
             Console.SetCursorPosition(cx, cy);
         }
 
-        // Draw border using displayWidth/displayHeight
         private void DrawBoundary()
         {
             int w = displayWidth;
@@ -238,22 +216,19 @@ namespace SnakeGame
             }
         }
 
-        // Print the persistent AI line (keeps it visible)
         private void PrintPersistentAiLine()
         {
             SafeSetCursor(0, aiPersistentLine);
             int width = Math.Max(0, Console.WindowWidth - 1);
-            Console.Write(new string(' ', width)); // clear line
+            Console.Write(new string(' ', width));
             SafeSetCursor(0, aiPersistentLine);
             string show = lastAiMessage ?? "";
             if (show.Length > width - 4) show = show.Substring(0, width - 7) + "...";
             Console.Write("AI: " + show);
         }
 
-        // Display the snake, food, and info (score/time) - called every frame
         private void DisplayGame()
         {
-            // Draw snake
             foreach (var p in snake.Body)
             {
                 if (IsInsideDisplayArea(p))
@@ -263,14 +238,12 @@ namespace SnakeGame
                 }
             }
 
-            // Draw food
             if (IsInsideDisplayArea(food))
             {
                 SafeSetCursor(food.X, food.Y);
                 Console.Write("●");
             }
 
-            // Info line (score/time) - reprinted every frame
             SafeSetCursor(0, infoLine);
             int width = Math.Max(0, Console.WindowWidth - 1);
             Console.Write(new string(' ', width));
@@ -278,7 +251,6 @@ namespace SnakeGame
             Console.Write($"Score: {score}   Time: {survivalTime}s   MaxLen: {maxSnakeLength}");
         }
 
-        // Listen for arrow keys
         private void ListenForInput()
         {
             while (true)
@@ -309,7 +281,6 @@ namespace SnakeGame
             }
         }
 
-        // Generate food (AI mode asks AI, otherwise local random)
         private async Task GenerateFood()
         {
             if (gameMode == GameMode.AI)
@@ -323,10 +294,9 @@ namespace SnakeGame
                         return;
                     }
                 }
-                catch { /* fallback to local */ }
+                catch { /* fallback */ }
             }
 
-            // fallback local random
             Random rnd = new Random(Guid.NewGuid().GetHashCode());
             Position candidate;
             do
@@ -336,20 +306,17 @@ namespace SnakeGame
             food = candidate;
         }
 
-        // Check if position is inside playable area (not on border)
         private bool IsInsideDisplayArea(Position p)
         {
             return p.X > 0 && p.X < displayWidth && p.Y > 0 && p.Y < displayHeight;
         }
 
-        // Valid position: inside and not on snake body
         private bool IsValidPosition(Position pos)
         {
             return pos.X > 0 && pos.X < displayWidth && pos.Y > 0 && pos.Y < displayHeight &&
                    !snake.Body.Any(b => b.X == pos.X && b.Y == pos.Y);
         }
 
-        // Parse AI returned position (supports "X:5,Y:3" or "5,3" etc.)
         private bool TryParsePosition(string input, out Position pos)
         {
             pos = new Position(0, 0);
@@ -383,7 +350,6 @@ namespace SnakeGame
             return false;
         }
 
-        // Collision detection; returns true if game should end
         private bool CheckCollisions()
         {
             if (snake.Head.X <= 0 || snake.Head.X >= displayWidth || snake.Head.Y <= 0 || snake.Head.Y >= displayHeight)
@@ -400,7 +366,6 @@ namespace SnakeGame
         }
     }
 
-    // Snake class: body list, move & grow
     public class Snake
     {
         public List<Position> Body { get; set; }
@@ -427,7 +392,6 @@ namespace SnakeGame
             Body.RemoveAt(Body.Count - 1);
         }
 
-        // Grow by duplicating tail (next frame movement keeps the extra tail)
         public void Grow()
         {
             Body.Add(Body.Last());
@@ -437,10 +401,8 @@ namespace SnakeGame
     public struct Position { public int X; public int Y; public Position(int x, int y) { X = x; Y = y; } }
     public enum Direction { Up, Down, Left, Right }
 
-    // AIService: single-instance HttpClient, methods used only at start / on-eat / on-gameover
     public class AIService
     {
-        // NOTE: in production move key to env var or config
         private readonly string apiKey = "6b11364e-8591-40bd-b257-7b5c0e0b8653";
         private readonly string endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions";
         private readonly HttpClient client;
@@ -450,73 +412,51 @@ namespace SnakeGame
             client = new HttpClient();
         }
 
-        // Called at start: one-time interaction
+        // Start prompt: force direct single-sentence output
         public async Task<string> GetInteractionOnceAsync(string stateSummary)
         {
             var body = new
             {
                 model = "doubao-seed-1-6-251015",
-                max_completion_tokens = 200,
+                max_completion_tokens = 80,
                 messages = new object[]
                 {
                     new {
                         role = "user",
                         content = new object[]
                         {
-                            new { text = $"游戏开始。{stateSummary}。请用一句话鼓励玩家或给出小提示（不超过一句）", type = "text" }
+                            new { text = $"{stateSummary} 请只输出一句中文鼓励或实用提示，**不要解释、不用展示思考过程、不要多余文本、不要引号**。", type = "text" }
                         }
                     }
                 },
                 reasoning_effort = "low"
             };
-            return await PostAndExtractAsync(body);
+            return await PostAndExtractSingleLineAsync(body);
         }
 
-        // Called when snake eats food: one-time short feedback
+        // On-eat prompt: force direct single-sentence output
         public async Task<string> GetInteractionOnEatAsync(string stateSummary)
         {
             var body = new
             {
                 model = "doubao-seed-1-6-251015",
-                max_completion_tokens = 180,
+                max_completion_tokens = 80,
                 messages = new object[]
                 {
                     new {
                         role = "user",
                         content = new object[]
                         {
-                            new { text = $"玩家吃到食物：{stateSummary}。请用一句话鼓励或简短点评（不超过一句）。", type = "text" }
+                            new { text = $"{stateSummary} 请只输出一句中文鼓励或实用提示，**不要解释、不用展示思考过程、不要多余文本、不要引号**。", type = "text" }
                         }
                     }
                 },
                 reasoning_effort = "low"
             };
-            return await PostAndExtractAsync(body);
+            return await PostAndExtractSingleLineAsync(body);
         }
 
-        // Called at gameover for detailed summary
-        public async Task<string> GenerateSummaryAsync(string prompt)
-        {
-            var body = new
-            {
-                model = "doubao-seed-1-6-251015",
-                max_completion_tokens = 800,
-                messages = new object[]
-                {
-                    new {
-                        role = "user",
-                        content = new object[]
-                        {
-                            new { text = prompt, type = "text" }
-                        }
-                    }
-                },
-                reasoning_effort = "medium"
-            };
-            return await PostAndExtractAsync(body);
-        }
-
-        // Called by Game.GenerateFood when in AI mode to ask for a food position
+        // Generate food position (unchanged)
         public async Task<string> GetFoodPositionAsync(List<Position> snakeBody)
         {
             string snakePositions = string.Join(";", snakeBody.Select(p => $"({p.X},{p.Y})"));
@@ -539,8 +479,30 @@ namespace SnakeGame
             return await PostAndExtractAsync(body);
         }
 
-        // Helper: POST and try to extract readable text from response
-        private async Task<string> PostAndExtractAsync(object body)
+        // Generate summary at gameover (can be multi-sentence)
+        public async Task<string> GenerateSummaryAsync(string prompt)
+        {
+            var body = new
+            {
+                model = "doubao-seed-1-6-251015",
+                max_completion_tokens = 800,
+                messages = new object[]
+                {
+                    new {
+                        role = "user",
+                        content = new object[]
+                        {
+                            new { text = prompt, type = "text" }
+                        }
+                    }
+                },
+                reasoning_effort = "medium"
+            };
+            return await PostAndExtractAsync(body);
+        }
+
+        // Post and extract single-line response: prefer a single short string (no explanation)
+        private async Task<string> PostAndExtractSingleLineAsync(object body)
         {
             try
             {
@@ -553,6 +515,53 @@ namespace SnakeGame
                 resp.EnsureSuccessStatusCode();
                 var raw = await resp.Content.ReadAsStringAsync();
 
+                // Try to extract likely answer string
+                var extracted = ExtractTextFromApiResponse(raw).Trim();
+
+                // If extracted contains multiple sentences or long explanation, take first sentence/line
+                if (string.IsNullOrWhiteSpace(extracted)) return "";
+                // Split by common sentence delimiters, prefer the first non-empty
+                var candidates = extracted.Split(new[] { '\n', '.', '。', '!', '！' }, StringSplitOptions.RemoveEmptyEntries)
+                                          .Select(s => s.Trim())
+                                          .Where(s => s.Length > 0)
+                                          .ToArray();
+                if (candidates.Length > 0)
+                {
+                    // Return first candidate as the single-line message
+                    string one = candidates[0];
+                    // Remove surrounding quotes if present
+                    if ((one.StartsWith("\"") && one.EndsWith("\"")) || (one.StartsWith("“") && one.EndsWith("”")))
+                    {
+                        one = one.Substring(1, one.Length - 2);
+                    }
+                    // Final safety: ensure not too long
+                    if (one.Length > 120) one = one.Substring(0, 117) + "...";
+                    return one;
+                }
+
+                // fallback to truncated raw
+                if (extracted.Length > 120) return extracted.Substring(0, 117) + "...";
+                return extracted;
+            }
+            catch (Exception ex)
+            {
+                return $"[AI 调用失败：{ex.Message}]";
+            }
+        }
+
+        // General POST + extract (for position & summary)
+        private async Task<string> PostAndExtractAsync(object body)
+        {
+            try
+            {
+                string payload = System.Text.Json.JsonSerializer.Serialize(body);
+                var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                var req = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = content };
+                req.Headers.Add("Authorization", $"Bearer {apiKey}");
+
+                var resp = await client.SendAsync(req);
+                resp.EnsureSuccessStatusCode();
+                var raw = await resp.Content.ReadAsStringAsync();
                 return ExtractTextFromApiResponse(raw);
             }
             catch (Exception ex)
@@ -561,7 +570,7 @@ namespace SnakeGame
             }
         }
 
-        // Try to pull a meaningful string from the API response (works for many JSON formats)
+        // Best-effort extract of readable text from possibly JSON responses
         private string ExtractTextFromApiResponse(string raw)
         {
             if (string.IsNullOrWhiteSpace(raw)) return "";
@@ -591,7 +600,6 @@ namespace SnakeGame
             }
             catch { /* not json or parse failed */ }
 
-            // fallback: clean up whitespace and return truncated raw
             var cleaned = raw.Replace("\r", " ").Replace("\n", " ").Trim();
             if (cleaned.Length > 2000) cleaned = cleaned.Substring(0, 2000) + "...";
             return cleaned;

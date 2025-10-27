@@ -12,3 +12,4 @@ E:\Codes\C#\SnakeGameWithAI\SnakeGameWithAI\obj\Debug\net8.0\refint\SnakeGameWit
 E:\Codes\C#\SnakeGameWithAI\SnakeGameWithAI\obj\Debug\net8.0\SnakeGameWithAI.pdb
 E:\Codes\C#\SnakeGameWithAI\SnakeGameWithAI\obj\Debug\net8.0\SnakeGameWithAI.genruntimeconfig.cache
 E:\Codes\C#\SnakeGameWithAI\SnakeGameWithAI\obj\Debug\net8.0\ref\SnakeGameWithAI.dll
+E:\Codes\C#\SnakeGameWithAI\SnakeGameWithAI\obj\Debug\net8.0\SnakeGameWithAI.sourcelink.json
